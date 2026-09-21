@@ -88,7 +88,7 @@ function readZones() {
 function readInputs() {
   const circumference = parseFloat($('circumference').value);
   const seamWidth = parseFloat($('seamWidth').value);
-  return { circumference, seamWidth, zones: readZones() };
+  return { circumference, seamWidth, zones: readZones(), gear: readGear() };
 }
 
 function readMultiInputs() {
@@ -96,7 +96,36 @@ function readMultiInputs() {
     parseFloat(i.value)
   );
   const seamWidth = parseFloat($('seamWidth').value);
-  return { circumferences, seamWidth, zones: readZones() };
+  return { circumferences, seamWidth, zones: readZones(), gear: readGear() };
+}
+
+/* ---------------- 设备档位 ---------------- */
+
+/** 读取档位输入；未勾选返回 null。输入框内容在模式切换时保留在 DOM 中。 */
+function readGear() {
+  if (!$('gearEnabled').checked) return null;
+  const raw = {
+    enabled: true,
+    positions: parseFloat($('gearPositions').value),
+    offsetDeg: parseFloat($('gearOffset').value),
+  };
+  return raw;
+}
+
+/** 校验档位输入（与服务端同规则），返回归一化档位或错误信息。 */
+function validateGearClient(raw) {
+  if (raw === null) return { gear: null };
+  const normalized = GearPositions.normalizeGear(raw);
+  if (!normalized.ok) return { error: normalized.error };
+  return { gear: normalized.gear };
+}
+
+/** 档位命中：当前角度是否为可用档位。 */
+function gearUsableAt(deg) {
+  const r = state.mode === 'multi' ? state.multiResult : state.result;
+  const g = r && r.gear;
+  if (!g || !g.usable) return false;
+  return g.usable.some((u) => Math.abs(((u.deg - deg + 180) % 360 + 360) % 360 - 180) < 1e-6);
 }
 
 /* ---------------- 模式切换（两个表单都保留在 DOM，互不丢输入） ---------------- */
@@ -113,7 +142,13 @@ function setMode(mode) {
   $('multiResults').hidden = mode !== 'multi';
   $('multiLegend').hidden = mode !== 'multi';
   $('previewHint').textContent =
-    mode === 'multi' ? '拖动圆盘旋转，自动吸附到所有规格均安全的最近角度' : '拖动圆盘旋转，自动吸附到最近可行位置';
+    mode === 'multi'
+      ? $('gearEnabled').checked
+        ? '拖动圆盘旋转，仅吸附到所有规格均安全的可用档位'
+        : '拖动圆盘旋转，自动吸附到所有规格均安全的最近角度'
+      : $('gearEnabled').checked
+        ? '拖动圆盘旋转，仅吸附到可行的可用档位'
+        : '拖动圆盘旋转，自动吸附到最近可行位置';
 
   if (mode === 'multi' && $('specs').children.length === 0) {
     const c = parseFloat($('circumference').value);
@@ -148,6 +183,9 @@ async function compute() {
   if (body.zones.some((z) => !Number.isFinite(z.start) || !Number.isFinite(z.end))) {
     return showError('保护区的起点与终点必须为数值 (mm)');
   }
+  const gearCheck = validateGearClient(body.gear);
+  if (gearCheck.error) return showError(gearCheck.error);
+  body.gear = gearCheck.gear;
 
   let result;
   try {
@@ -164,11 +202,48 @@ async function compute() {
 
   state.result = result;
   state.lastInput = body;
-  // 默认选择：距禁用边界最远、角度最小的旋转量
-  if (result.best) state.thetaMm = result.best.mm;
+  applyDefaultAngleSingle(result);
   exitDiffMode();
   renderResults();
   draw();
+}
+
+/**
+ * 单规格默认位置：启用档位时取默认档位；连续有解但无可用档位时，
+ * 定位到距可行段最近的后档位（无后档位则前档位），与整圈禁用区分。
+ */
+function applyDefaultAngleSingle(result) {
+  const C = result.circumference;
+  const g = result.gear;
+  if (g && g.best) {
+    state.thetaMm = (g.best.deg / 360) * C;
+    return;
+  }
+  if (g && g.nearest) {
+    const n = g.nearest.after || g.nearest.before;
+    if (n) {
+      state.thetaMm = (n.deg / 360) * C;
+      return;
+    }
+  }
+  if (result.best) state.thetaMm = result.best.mm;
+}
+
+/** 多规格默认共用角度，规则同上（角度域）。 */
+function applyDefaultAngleMulti(result) {
+  const g = result.gear;
+  if (g && g.best) {
+    state.thetaDeg = g.best.deg;
+    return;
+  }
+  if (g && g.nearest) {
+    const n = g.nearest.after || g.nearest.before;
+    if (n) {
+      state.thetaDeg = n.deg;
+      return;
+    }
+  }
+  if (result.best) state.thetaDeg = result.best.deg;
 }
 
 async function computeMulti() {
@@ -186,6 +261,9 @@ async function computeMulti() {
   if (body.zones.some((z) => !Number.isFinite(z.start) || !Number.isFinite(z.end))) {
     return showError('保护区的起点与终点必须为数值 (mm)');
   }
+  const gearCheck = validateGearClient(body.gear);
+  if (gearCheck.error) return showError(gearCheck.error);
+  body.gear = gearCheck.gear;
 
   let result;
   try {
@@ -202,7 +280,7 @@ async function computeMulti() {
 
   state.multiResult = result;
   state.lastInput = null; // 多规格结果不进入单规格快照
-  if (result.best) state.thetaDeg = result.best.deg;
+  applyDefaultAngleMulti(result);
   exitDiffMode();
   renderMultiResults();
   draw();
@@ -211,6 +289,55 @@ async function computeMulti() {
 function showError(msg) {
   $('error').textContent = msg;
   $('error').hidden = false;
+}
+
+/* ---------------- 档位结果辅助 ---------------- */
+
+const nearLabel = (side) => (side === 'before' ? '前一档（逆时针）' : '后一档（顺时针）');
+
+function gearNearLine(n, side) {
+  if (!n) return '';
+  return (
+    `<div class="near-item">距可行段最近的${nearLabel(side)}：` +
+    `档位 <span class="num">#${n.index + 1}</span> ${fmtDeg(n.deg)}°` +
+    `，角距离 ${fmtDeg(n.distanceDeg)}°（可行段边界 ${fmtDeg(n.boundaryDeg)}°）</div>`
+  );
+}
+
+function renderGearMissHtml(g) {
+  return (
+    '<strong>连续区间有解，但没有可用档位：</strong>所有档位都落在禁用区间内（区别于保护区覆盖整圈）。' +
+    gearNearLine(g.nearest.before, 'before') +
+    gearNearLine(g.nearest.after, 'after')
+  );
+}
+
+/** 高亮当前角度所在的可用档位行（灰显的理论档位不参与）。 */
+function markActiveGear(listEl, g) {
+  const curDeg =
+    state.mode === 'multi'
+      ? state.thetaDeg
+      : (state.thetaMm / state.result.circumference) * 360;
+  const usableRows = [...listEl.children].filter((li) => !li.classList.contains('disabled'));
+  usableRows.forEach((li, i) => {
+    const u = g.usable[i];
+    if (!u) return;
+    const d = Math.abs(((u.deg - curDeg + 180) % 360 + 360) % 360 - 180);
+    li.classList.toggle('active', d < 1e-6);
+  });
+}
+
+/** 把角度吸附到最近的可用档位；无可用档位返回 null。 */
+function snapToGearDeg(deg, g) {
+  if (!g || g.usable.length === 0) return null;
+  let best = null;
+  for (const u of g.usable) {
+    const d = Math.abs(((u.deg - deg + 180) % 360 + 360) % 360 - 180);
+    if (!best || d < best.d - 1e-9 || (Math.abs(d - best.d) <= 1e-9 && u.deg < best.u.deg)) {
+      best = { d, u };
+    }
+  }
+  return best ? best.u.deg : null;
 }
 
 /* ---------------- 结果渲染 ---------------- */
@@ -227,15 +354,38 @@ function segText(s) {
 
 function renderResults() {
   const r = state.result;
+  const g = r.gear;
+  const gearOn = !!g;
 
   const bestBox = $('bestBox');
-  if (r.best) {
+  const gearBestBox = $('gearBestBox');
+  const gearMissBox = $('gearMissBox');
+  bestBox.hidden = gearOn;
+  gearBestBox.hidden = !(gearOn && g.best);
+  gearMissBox.hidden = true;
+
+  if (!gearOn && r.best) {
     bestBox.hidden = false;
     bestBox.innerHTML =
       `默认旋转量（距禁用边界最远、角度最小）：<br>` +
       `<span class="num">${fmtDeg(r.best.deg)}°</span> ＝ ${fmtMm(r.best.mm)} mm`;
-  } else {
-    bestBox.hidden = true;
+  }
+
+  if (gearOn) {
+    if (g.best) {
+      const gapText =
+        g.best.gapDeg === null
+          ? '无禁用边界'
+          : `瓶颈间隙 ${fmtDeg(g.best.gapDeg)}°`;
+      gearBestBox.innerHTML =
+        `默认档位（瓶颈间隙最大、角度较小优先）：<br>` +
+        `档位 <span class="num">#${g.best.index + 1}</span> ＝ ` +
+        `<span class="num">${fmtDeg(g.best.deg)}°</span>` +
+        ` ＝ ${fmtMm(g.best.mm)} mm ｜ ${gapText}`;
+    } else if (!r.noSolution && g.nearest) {
+      gearMissBox.hidden = false;
+      gearMissBox.innerHTML = renderGearMissHtml(g);
+    }
   }
 
   $('noSolutionBox').hidden = !r.noSolution;
@@ -249,6 +399,46 @@ function renderResults() {
       .join('');
   }
 
+  // 可用档位列表
+  const gw = $('gearListWrap');
+  gw.hidden = !gearOn;
+  if (gearOn) {
+    $('gearListCount').textContent =
+      r.noSolution
+        ? '（整圈禁用，无可用档位）'
+        : g.usable.length
+          ? `（共 ${g.usable.length}/${g.positions} 档可用）`
+          : '（0 档可用）';
+    const gl = $('gearList');
+    gl.innerHTML = '';
+    if (g.usable.length === 0 && Array.isArray(g.allGears)) {
+      for (const a of g.allGears) {
+        const li = document.createElement('li');
+        li.className = 'gear-item disabled';
+        li.innerHTML =
+          `<span>#${a.index + 1}：${fmtDeg(a.deg)}° ＝ ${fmtMm((a.deg / 360) * r.circumference)} mm</span>` +
+          `<span class="tag">禁用</span>`;
+        gl.appendChild(li);
+      }
+    }
+    for (const u of g.usable) {
+      const li = document.createElement('li');
+      li.className = 'gear-item';
+      const gap = u.gapDeg === null ? '无禁用边界' : `间隙 ${fmtDeg(u.gapDeg)}°`;
+      li.innerHTML =
+        `<span>#${u.index + 1}：${fmtDeg(u.deg)}° ＝ ${fmtMm(u.mm)} mm</span>` +
+        `<span class="tag">${gap}</span>`;
+      li.title = '点击吸附到该档位';
+      li.addEventListener('click', () => {
+        state.thetaMm = (u.deg / 360) * r.circumference;
+        renderResults();
+        draw();
+      });
+      gl.appendChild(li);
+    }
+    markActiveGear(gl, g);
+  }
+
   $('feasibleCount').textContent = r.noSolution ? '（无）' : `（共 ${r.feasible.length} 段）`;
   const fl = $('feasibleList');
   fl.innerHTML = '';
@@ -256,12 +446,18 @@ function renderResults() {
     const li = document.createElement('li');
     li.className = 'feasible';
     li.innerHTML = `<span>段 ${i + 1}：${segText(s)}</span><span class="tag">宽 ${fmtDeg(s.widthDeg)}°</span>`;
-    li.title = '点击将该段中点设为接缝位置';
+    li.title = gearOn ? '点击吸附到该段内最近的可用档位' : '点击将该段中点设为接缝位置';
     li.addEventListener('click', () => {
       const C = r.circumference;
       const sMm = s.startMm;
       const eMm = s.wraps ? s.endMm + C : s.endMm;
-      state.thetaMm = mod((sMm + eMm) / 2, C);
+      if (gearOn) {
+        const midDeg = (((sMm + eMm) / 2 / C) * 360 + 360) % 360;
+        const snapped = snapToGearDeg(midDeg, g);
+        if (snapped !== null) state.thetaMm = (snapped / 360) * C;
+      } else {
+        state.thetaMm = mod((sMm + eMm) / 2, C);
+      }
       renderResults();
       draw();
     });
@@ -306,13 +502,19 @@ function arcText(a) {
 function renderMultiResults() {
   const r = state.multiResult;
   if (!r) return;
+  const g = r.gear;
+  const gearOn = !!g;
 
   const bestBox = $('multiBestBox');
+  const gearBestBox = $('multiGearBestBox');
+  const gearMissBox = $('multiGearMissBox');
   const noBox = $('multiNoSolutionBox');
-  bestBox.hidden = !!r.noSolution;
+  bestBox.hidden = !!r.noSolution || gearOn;
+  gearBestBox.hidden = !(gearOn && g.best);
+  gearMissBox.hidden = true;
   noBox.hidden = !r.noSolution;
 
-  if (!r.noSolution && r.best) {
+  if (!gearOn && !r.noSolution && r.best) {
     let line = '';
     if (r.best.minGapDeg === null) {
       line =
@@ -328,14 +530,36 @@ function renderMultiResults() {
         } mm）`;
       const per = r.best.gaps
         .map(
-          (g) =>
-            `规格 ${g.index + 1}：${g.gapDeg === null ? '无禁用区' : fmtDeg(g.gapDeg) + '°'}` +
-            `（接缝落在 ${fmtMm(g.mm)} mm）`
+          (gg) =>
+            `规格 ${gg.index + 1}：${gg.gapDeg === null ? '无禁用区' : fmtDeg(gg.gapDeg) + '°'}` +
+            `（接缝落在 ${fmtMm(gg.mm)} mm）`
         )
         .join('<br>');
       line += `<div class="gap-detail">${per}</div>`;
     }
     bestBox.innerHTML = line;
+  }
+
+  if (gearOn) {
+    if (g.best) {
+      const per = g.best.gaps
+        .map(
+          (gg) =>
+            `规格 ${gg.index + 1}：${gg.gapDeg === null ? '无禁用区' : fmtDeg(gg.gapDeg) + '°'}` +
+            `（接缝落在 ${fmtMm(gg.mm)} mm）`
+        )
+        .join('<br>');
+      const gapText =
+        g.best.gapDeg === null ? '无禁用边界' : `瓶颈间隙 ${fmtDeg(g.best.gapDeg)}°`;
+      gearBestBox.innerHTML =
+        `默认档位（瓶颈间隙最大、角度较小优先）：<br>` +
+        `档位 <span class="num">#${g.best.index + 1}</span> ＝ ` +
+        `<span class="num">${fmtDeg(g.best.deg)}°</span> ｜ ${gapText}` +
+        `<div class="gap-detail">${per}</div>`;
+    } else if (!r.noSolution && g.nearest) {
+      gearMissBox.hidden = false;
+      gearMissBox.innerHTML = renderGearMissHtml(g);
+    }
   }
 
   if (r.noSolution && r.blocker) {
@@ -352,6 +576,54 @@ function renderMultiResults() {
       conflicts;
   }
 
+  // 可用档位列表
+  const gw = $('multiGearListWrap');
+  gw.hidden = !gearOn;
+  if (gearOn) {
+    $('multiGearListCount').textContent =
+      r.noSolution
+        ? '（无公共可行段，无可用档位）'
+        : g.usable.length
+          ? `（共 ${g.usable.length}/${g.positions} 档可用）`
+          : '（0 档可用）';
+    const gl = $('multiGearList');
+    gl.innerHTML = '';
+    if (g.usable.length === 0 && Array.isArray(g.allGears)) {
+      for (const a of g.allGears) {
+        const li = document.createElement('li');
+        li.className = 'gear-item disabled';
+        li.innerHTML =
+          `<span>#${a.index + 1}：${fmtDeg(a.deg)}°</span>` +
+          `<span class="tag">禁用</span>`;
+        gl.appendChild(li);
+      }
+    }
+    for (const u of g.usable) {
+      const li = document.createElement('li');
+      li.className = 'gear-item';
+      const minGap = Math.min(
+        ...u.gaps.map((gg) => (gg.gapDeg === null ? Infinity : gg.gapDeg))
+      );
+      const gap = !Number.isFinite(minGap)
+        ? '无禁用边界'
+        : `瓶颈间隙 ${fmtDeg(minGap)}°`;
+      const per = u.gaps
+        .map((gg) => `规${gg.index + 1}:${gg.gapDeg === null ? '∞' : fmtDeg(gg.gapDeg)}°`)
+        .join(' ');
+      li.innerHTML =
+        `<span>#${u.index + 1}：${fmtDeg(u.deg)}°</span>` +
+        `<span class="tag" title="${per}">${gap}</span>`;
+      li.title = per + '\n点击吸附到该档位';
+      li.addEventListener('click', () => {
+        state.thetaDeg = u.deg;
+        renderMultiResults();
+        draw();
+      });
+      gl.appendChild(li);
+    }
+    markActiveGear(gl, g);
+  }
+
   $('commonCount').textContent = r.noSolution
     ? '（无）'
     : r.fullCircle
@@ -366,9 +638,15 @@ function renderMultiResults() {
       li.innerHTML = a.full
         ? `<span>整圈：0.0° → 360.0°</span><span class="tag">宽 360.0°</span>`
         : `<span>共用段：${arcText(a)}</span><span class="tag">宽 ${fmtDeg(a.widthDeg)}°</span>`;
-      li.title = '点击将该段中点设为共用角度';
+      li.title = gearOn ? '点击吸附到该段内最近的可用档位' : '点击将该段中点设为共用角度';
       li.addEventListener('click', () => {
-        state.thetaDeg = a.full ? 0 : mod((a.startDeg + (a.wraps ? a.endDeg + 360 : a.endDeg)) / 2, 360);
+        if (gearOn) {
+          const mid = a.full ? 0 : mod((a.startDeg + (a.wraps ? a.endDeg + 360 : a.endDeg)) / 2, 360);
+          const snapped = snapToGearDeg(mid, g);
+          if (snapped !== null) state.thetaDeg = snapped;
+        } else {
+          state.thetaDeg = a.full ? 0 : mod((a.startDeg + (a.wraps ? a.endDeg + 360 : a.endDeg)) / 2, 360);
+        }
         renderMultiResults();
         draw();
       });
@@ -442,12 +720,17 @@ function renderMultiLegend() {
 
 /* ---------------- 吸附 ---------------- */
 
-/** 将角度 m (mm) 吸附到最近可行位置；无解时返回 null */
+/** 将角度 m (mm) 吸附到最近可行位置；无解时返回 null。启用档位时只吸附到可用档位。 */
 function snapToFeasible(m) {
   const r = state.result;
   if (!r || r.noSolution) return null;
   const C = r.circumference;
   if (r.feasible.length === 0) return null;
+
+  if (r.gear) {
+    const deg = snapToGearDeg((m / C) * 360, r.gear);
+    return deg === null ? null : (deg / 360) * C;
+  }
 
   const inGap = (x) =>
     r.feasible.some((s) => {
@@ -468,10 +751,11 @@ function snapToFeasible(m) {
   return best ? best.v : null;
 }
 
-/** 多规格：将角度吸附到最近的共用安全段；无共同解返回 null。 */
+/** 多规格：将角度吸附到最近的共用安全段；无共同解返回 null。启用档位时只吸附到可用档位。 */
 function snapToCommon(m) {
   const r = state.multiResult;
   if (!r || r.noSolution) return null;
+  if (r.gear) return snapToGearDeg(m, r.gear);
   if (r.fullCircle) return m;
 
   const inArc = (x, a) =>
@@ -530,6 +814,74 @@ function drawRingSegments(cx, cy, r, segments, C, color, width) {
   }
 }
 
+/* ---------------- 设备档位 Canvas ---------------- */
+
+function degRad2(deg) {
+  return (deg / 360) * TAU - Math.PI / 2;
+}
+
+/**
+ * 绘制档位：全部档位画细刻度；可用档位画绿色圆点；
+ * nearest 非空时以橙色标出距可行段最近的前/后档位。
+ */
+function drawGearOverlay(cx, cy, rInner, rTick, rDot, g, currentDeg) {
+  const onGear = g.usable.some(
+    (u) => Math.abs(((u.deg - currentDeg + 180) % 360 + 360) % 360 - 180) < 0.5
+  );
+
+  // 全部档位细刻度
+  ctx.strokeStyle = '#9ca3af';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < g.positions; i++) {
+    const a = degRad2(GearPositions.gearAngleDeg(i, g.positions, g.offsetDeg));
+    ctx.beginPath();
+    ctx.moveTo(cx + (rTick - 3) * Math.cos(a), cy + (rTick - 3) * Math.sin(a));
+    ctx.lineTo(cx + (rTick + 3) * Math.cos(a), cy + (rTick + 3) * Math.sin(a));
+    ctx.stroke();
+  }
+
+  // 可用档位绿色圆点
+  for (const u of g.usable) {
+    const a = degRad2(u.deg);
+    ctx.beginPath();
+    ctx.arc(cx + (rInner - 10) * Math.cos(a), cy + (rInner - 10) * Math.sin(a), 3.2, 0, TAU);
+    ctx.fillStyle = '#047857';
+    ctx.fill();
+  }
+
+  // 缺档场景：最近前/后档位橙色点
+  if (g.nearest) {
+    for (const n of [g.nearest.before, g.nearest.after]) {
+      if (!n) continue;
+      const a = degRad2(n.deg);
+      ctx.beginPath();
+      ctx.arc(cx + (rInner - 10) * Math.cos(a), cy + (rInner - 10) * Math.sin(a), 4.5, 0, TAU);
+      ctx.fillStyle = '#d97706';
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = '#92400e';
+      ctx.stroke();
+    }
+  }
+
+  // 当前角度恰为可用档位时在环外画青色菱形
+  if (onGear) {
+    const a = degRad2(currentDeg);
+    const rr = rDot + 4;
+    ctx.beginPath();
+    for (let k = 0; k < 4; k++) {
+      const aa = a + (k * Math.PI) / 2;
+      const px = cx + rr * Math.cos(aa);
+      const py = cy + rr * Math.sin(aa);
+      if (k === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fillStyle = '#0e7490';
+    ctx.fill();
+  }
+}
+
 function drawSingle() {
   const r = state.result;
   const { cx, cy, R, size } = geom();
@@ -579,6 +931,13 @@ function drawSingle() {
   drawRingSegments(cx, cy, R - 34, zoneSegs, C, '#e8912d', 12);
   ctx.globalAlpha = 1;
 
+  // 设备档位刻度与标记
+  const g = r.gear;
+  if (g) drawGearOverlay(cx, cy, R - 9, R + 23, R + 26, g, (state.thetaMm / C) * 360);
+
+  // 当前角度是否落在可用档位（缺档时显示为橙色预警）
+  const onUsableGear = g ? gearUsableAt((state.thetaMm / C) * 360) : true;
+
   // 接缝扇形（宽度 = 接缝安全宽度）
   const theta = state.thetaMm;
   const a0 = rad(theta, C);
@@ -587,11 +946,15 @@ function drawSingle() {
   ctx.moveTo(cx, cy);
   ctx.arc(cx, cy, R - 46, a0, a1, false);
   ctx.closePath();
-  ctx.fillStyle = r.noSolution ? 'rgba(212,58,58,0.18)' : 'rgba(37,99,235,0.18)';
+  ctx.fillStyle = r.noSolution
+    ? 'rgba(212,58,58,0.18)'
+    : onUsableGear
+      ? 'rgba(37,99,235,0.18)'
+      : 'rgba(217,119,6,0.2)';
   ctx.fill();
 
   // 接缝位置线
-  ctx.strokeStyle = r.noSolution ? '#d43a3a' : '#2563eb';
+  ctx.strokeStyle = r.noSolution ? '#d43a3a' : onUsableGear ? '#2563eb' : '#d97706';
   ctx.lineWidth = 3;
   ctx.beginPath();
   ctx.moveTo(cx + (R - 46) * Math.cos(a0), cy + (R - 46) * Math.sin(a0));
@@ -612,9 +975,10 @@ function drawSingle() {
     ctx.restore();
   }
 
-  // 最优位置标记
-  if (r.best) {
-    const ab = rad(r.best.mm, C);
+  // 最优位置标记（启用档位时指向默认档位）
+  const marker = g && g.best ? { mm: (g.best.deg / 360) * C } : r.best;
+  if (marker) {
+    const ab = rad(marker.mm, C);
     const bx = cx + (R + 10) * Math.cos(ab);
     const by = cy + (R + 10) * Math.sin(ab);
     ctx.fillStyle = '#065f46';
@@ -631,22 +995,37 @@ function drawSingle() {
   ctx.font = 'bold 22px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
+  const curDeg = (theta / C) * 360;
   if (r.noSolution) {
     ctx.fillStyle = '#d43a3a';
     ctx.fillText('无解', cx, cy - 12);
     ctx.font = '13px sans-serif';
     ctx.fillText('禁用区间覆盖整圈', cx, cy + 14);
   } else {
-    ctx.fillText(`${fmtDeg((theta / C) * 360)}°`, cx, cy - 10);
+    ctx.fillText(`${fmtDeg(curDeg)}°`, cx, cy - 10);
     ctx.font = '13px sans-serif';
-    ctx.fillStyle = '#6b7280';
-    ctx.fillText(`${fmtMm(theta)} mm`, cx, cy + 14);
+    ctx.fillStyle = onUsableGear ? '#6b7280' : '#b45309';
+    ctx.fillText(
+      g
+        ? onUsableGear
+          ? `${fmtMm(theta)} mm ｜ 档位 #${gearIndexOf(g, curDeg) + 1}`
+          : `${fmtMm(theta)} mm ｜ 非可用档位`
+        : `${fmtMm(theta)} mm`,
+      cx,
+      cy + 14
+    );
   }
 
   // 图例
   const legend = r.noSolution
     ? [['#d43a3a', '禁用（覆盖整圈）'], ['#e8912d', '印刷保护区']]
-    : [['#1e9e50', '可行'], ['#d43a3a', '禁用'], ['#e8912d', '印刷保护区'], ['#2563eb', '接缝']];
+    : [
+        ['#1e9e50', '可行'],
+        ['#d43a3a', '禁用'],
+        ['#e8912d', '印刷保护区'],
+        ['#2563eb', '接缝'],
+      ];
+  if (g && !r.noSolution) legend.push(['#047857', '可用档位']);
   ctx.font = '12px sans-serif';
   ctx.textAlign = 'left';
   let lx = 16;
@@ -659,11 +1038,23 @@ function drawSingle() {
   }
 
   // 当前位置文字
-  const deg = fmtDeg((theta / C) * 360);
+  const deg = fmtDeg(curDeg);
   $('currentPos').textContent = r.noSolution
     ? '当前无可行位置：请缩小接缝宽度或调整保护区'
-    : `当前接缝位置：${deg}°（${fmtMm(theta)} mm）`;
+    : g
+      ? onUsableGear
+        ? `当前接缝位置：${deg}°（${fmtMm(theta)} mm，档位 #${gearIndexOf(g, curDeg) + 1}）`
+        : `当前接缝位置：${deg}°（${fmtMm(theta)} mm）— 未落在可用档位，拖动将吸附到最近可用档位`
+      : `当前接缝位置：${deg}°（${fmtMm(theta)} mm）`;
   markActiveSegment();
+}
+
+/** 当前角度对应的档位序号（0 基）；不匹配返回 -1。 */
+function gearIndexOf(g, deg) {
+  for (const u of g.usable) {
+    if (Math.abs(((u.deg - deg + 180) % 360 + 360) % 360 - 180) < 1e-6) return u.index;
+  }
+  return -1;
 }
 
 /* ---------------- 多规格 Canvas ---------------- */
@@ -770,11 +1161,16 @@ function drawMulti() {
     });
   }
 
+  // 设备档位刻度（无共同解时也显示理论档位网格）
+  const mg = r.gear;
+  if (mg) drawGearOverlay(cx, cy, commonR - 6, R + 23, R + 26, mg, state.thetaDeg);
+
   // 当前共用角度位置线
   if (!r.noSolution) {
+    const onUsableGear = mg ? gearUsableAt(state.thetaDeg) : true;
     const theta = state.thetaDeg;
     const a = multiRadDeg(theta);
-    ctx.strokeStyle = '#2563eb';
+    ctx.strokeStyle = onUsableGear ? '#2563eb' : '#d97706';
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(cx + (commonR - 10) * Math.cos(a), cy + (commonR - 10) * Math.sin(a));
@@ -799,9 +1195,10 @@ function drawMulti() {
       ctx.restore();
     }
 
-    // 默认角度标记
-    if (r.best) {
-      const ab = multiRadDeg(r.best.deg);
+    // 默认角度标记（启用档位时指向默认档位）
+    const markerDeg = mg && mg.best ? mg.best.deg : r.best ? r.best.deg : null;
+    if (markerDeg !== null) {
+      const ab = multiRadDeg(markerDeg);
       const bx = cx + (commonR + 12) * Math.cos(ab);
       const by = cy + (commonR + 12) * Math.sin(ab);
       ctx.fillStyle = '#065f46';
@@ -825,16 +1222,24 @@ function drawMulti() {
     ctx.font = '13px sans-serif';
     ctx.fillText(`规格 ${r.blocker ? r.blocker.index + 1 : ''} 使交集归零`, cx, cy + 14);
   } else {
+    const mOnGear = r.gear ? gearUsableAt(state.thetaDeg) : true;
     ctx.fillText(`${fmtDeg(state.thetaDeg)}°`, cx, cy - 10);
     ctx.font = n > 4 ? '11px sans-serif' : '13px sans-serif';
-    ctx.fillStyle = '#6b7280';
-    if (n <= 4) {
+    if (r.gear && !mOnGear) {
+      ctx.fillStyle = '#b45309';
+      ctx.fillText('非可用档位', cx, cy + 16);
+    } else if (r.gear) {
+      ctx.fillStyle = '#0e7490';
+      ctx.fillText(`档位 #${gearIndexOf(r.gear, state.thetaDeg) + 1}`, cx, cy + 16);
+    } else if (n <= 4) {
+      ctx.fillStyle = '#6b7280';
       const mmText = r.specs
         .map((s) => `规格${s.index + 1} ${fmtMm((state.thetaDeg / 360) * s.circumference)}mm`)
         .join(' ｜ ');
       ctx.fillText(mmText, cx, cy + 16);
     } else {
       // 规格较多时分两行展示，避免溢出圆盘
+      ctx.fillStyle = '#6b7280';
       const half = Math.ceil(n / 2);
       const lineOf = (list) =>
         list
@@ -847,8 +1252,11 @@ function drawMulti() {
 
   $('currentPos').textContent = r.noSolution
     ? '当前无所有规格均安全的共用角度'
-    : `当前共用角度：${fmtDeg(state.thetaDeg)}°`;
-  markActiveCommon();
+    : r.gear
+      ? gearUsableAt(state.thetaDeg)
+        ? `当前共用角度：${fmtDeg(state.thetaDeg)}°（档位 #${gearIndexOf(r.gear, state.thetaDeg) + 1}）`
+        : `当前共用角度：${fmtDeg(state.thetaDeg)}° — 未落在可用档位，拖动将吸附到最近可用档位`
+      : `当前共用角度：${fmtDeg(state.thetaDeg)}°`;  markActiveCommon();
 }
 
 /** 统一绘制入口：按当前模式分发。 */
@@ -954,7 +1362,8 @@ function snapshotMetaText(s) {
   const i = s.input;
   const zones = `${i.zones.length} 个保护区`;
   const noSol = s.result && s.result.noSolution ? ' · 无解' : '';
-  return `${fmtTime(s.createdAt)} ｜ C=${fmtMm(i.circumference)} W=${fmtMm(i.seamWidth)} mm ｜ ${zones}${noSol}`;
+  const gear = i.gear ? ` · ${i.gear.positions} 档/偏移 ${fmtDeg(i.gear.offsetDeg)}°` : '';
+  return `${fmtTime(s.createdAt)} ｜ C=${fmtMm(i.circumference)} W=${fmtMm(i.seamWidth)} mm ｜ ${zones}${gear}${noSol}`;
 }
 
 function renderSnapshotList() {
@@ -1059,6 +1468,13 @@ function loadSnapshot(id) {
   setMode('single');
   $('circumference').value = s.input.circumference;
   $('seamWidth').value = s.input.seamWidth;
+  const gear = s.input.gear || null;
+  $('gearEnabled').checked = !!gear;
+  $('gearFields').hidden = !gear;
+  if (gear) {
+    $('gearPositions').value = gear.positions;
+    $('gearOffset').value = gear.offsetDeg;
+  }
   $('zones').innerHTML = '';
   for (const z of s.input.zones) addZoneRow(z.start, z.end);
   compute();
@@ -1397,6 +1813,13 @@ document.querySelectorAll('.mode-btn').forEach((btn) => {
 $('compute').addEventListener('click', compute);
 $('circumference').addEventListener('input', scheduleCompute);
 $('seamWidth').addEventListener('input', scheduleCompute);
+$('gearEnabled').addEventListener('change', () => {
+  // 约束开关不清空已输入的档位数与偏移；setMode 会触发重算
+  $('gearFields').hidden = !$('gearEnabled').checked;
+  setMode(state.mode);
+});
+$('gearPositions').addEventListener('input', scheduleCompute);
+$('gearOffset').addEventListener('input', scheduleCompute);
 $('loadExample').addEventListener('click', () => {
   $('seamWidth').value = 20;
   $('zones').innerHTML = '';

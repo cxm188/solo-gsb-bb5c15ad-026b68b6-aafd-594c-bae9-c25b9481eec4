@@ -11,6 +11,7 @@
  */
 
 const EPS = 1e-9;
+const GearPositions = require('./gearPositions');
 
 function mod(n, m) {
   return ((n % m) + m) % m;
@@ -97,8 +98,11 @@ function computeGaps(merged, C) {
  * @param {number} C 周长 (mm)，> 0
  * @param {number} W 接缝安全宽度 (mm)，>= 0
  * @param {Array<{start: number, end: number}>} zones 印刷保护区 (mm)
+ * @param {object} [options]
+ * @param {null|{positions:number, offsetDeg:number}} [options.gear]
+ *   设备档位约束（已校验）；null/缺省表示不启用
  */
-function computeSeamAvoidance(C, W, zones) {
+function computeSeamAvoidance(C, W, zones, options = {}) {
   const zonePieces = [];
   const rawForbidden = [];
   for (const z of zones) {
@@ -159,10 +163,53 @@ function computeSeamAvoidance(C, W, zones) {
     endDeg: mmToDeg(b, C),
   });
 
+  // 设备档位：与可行段相交后离散选档；未启用为 null，整圈禁用仍给出档位清单以便展示
+  let gear = null;
+  if (options.gear) {
+    if (noSolution) {
+      // 整圈禁用：无可行段、无默认档位，直接列出理论档位（均不可用）
+      gear = {
+        enabled: true,
+        positions: options.gear.positions,
+        offsetDeg: GearPositions.mod(options.gear.offsetDeg, 360),
+        usable: [],
+        best: null,
+        nearest: null,
+        allGears: Array.from({ length: options.gear.positions }, (_, i) => ({
+          index: i,
+          deg: GearPositions.gearAngleDeg(i, options.gear.positions, options.gear.offsetDeg),
+        })),
+      };
+    } else {
+      const boundaryPts = [];
+      for (const [a, b] of merged) {
+        for (const x of [a, b]) boundaryPts.push(mmToDeg(mod(x, C), C));
+      }
+      const feasiblePieces = GearPositions.arcsToPieces(
+        feasible.map((g) => ({
+          startDeg: g.startDeg,
+          endDeg: g.endDeg,
+          widthDeg: g.widthDeg,
+          wraps: g.wraps,
+        }))
+      );
+      gear = GearPositions.evaluateGears({
+        positions: options.gear.positions,
+        offsetDeg: options.gear.offsetDeg,
+        feasiblePieces,
+        gapAtDeg: (deg) =>
+          GearPositions.minDistanceToBoundary(deg, boundaryPts),
+      });
+      // 附带毫米位置，便于前端展示
+      for (const item of gear.usable) item.mm = (item.deg / 360) * C;
+    }
+  }
+
   return {
     circumference: C,
     seamWidth: W,
     seamWidthDeg: mmToDeg(W, C),
+    gear,
     zonePieces: zonePieces.map((pieces) => pieces.map(toView)),
     // 每个保护区扩展后的禁用片段（按起点排序、未合并），无解时用于展示覆盖整圈的区间链
     forbiddenChain: rawForbidden

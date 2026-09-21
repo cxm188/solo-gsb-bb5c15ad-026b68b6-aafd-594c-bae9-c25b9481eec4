@@ -145,3 +145,116 @@ test('computeSeamAvoidance: 无保护区时整圈可行，默认 0°', () => {
   assert.equal(r.feasible[0].widthMm, 400);
   assert.equal(r.best.mm, 0);
 });
+
+/* ---------------- 设备档位约束 ---------------- */
+
+const gearOn = (positions, offsetDeg = 0) => ({ positions, offsetDeg });
+
+test('computeSeamAvoidance: 未启用档位时 gear 为 null，原结果不变', () => {
+  const r = computeSeamAvoidance(400, 20, [{ start: 60, end: 120 }]);
+  assert.equal(r.gear, null);
+  const r2 = computeSeamAvoidance(400, 20, [{ start: 60, end: 120 }], { gear: null });
+  assert.equal(r2.gear, null);
+});
+
+test('computeSeamAvoidance: 档位与可行段相交并按瓶颈间隙选默认档', () => {
+  // C=400 W=20：禁用 [40,120] 与 [180,260]（即 36°–108°、162°–234°）
+  // 8 档（0,45,90,135,180,225,270,315）：可用 0°、135°、270°、315°
+  const r = computeSeamAvoidance(
+    400,
+    20,
+    [
+      { start: 60, end: 120 },
+      { start: 200, end: 260 },
+    ],
+    { gear: gearOn(8) }
+  );
+  assert.equal(r.gear.positions, 8);
+  assert.equal(r.gear.offsetDeg, 0);
+  assert.deepEqual(r.gear.usable.map((u) => u.deg), [0, 135, 270, 315]);
+  // 各档间隙：0°→36、135°→27、270°→36、315°→81
+  assert.deepEqual(r.gear.usable.map((u) => Math.round(u.gapDeg)), [36, 27, 36, 81]);
+  assert.deepEqual(r.gear.usable.map((u) => Math.round(u.mm)), [0, 150, 300, 350]);
+  assert.equal(r.gear.best.deg, 315);
+  assert.equal(r.gear.best.mm, 350);
+  assert.equal(r.gear.nearest, null);
+});
+
+test('computeSeamAvoidance: 零位偏移旋转档位网格', () => {
+  // 偏移 22.5°，8 档：22.5,67.5,...,337.5；禁用 36°–108°
+  // 可用档位中 247.5° 距边界最远（247.5−108=139.5）
+  const r = computeSeamAvoidance(
+    400,
+    20,
+    [{ start: 60, end: 120 }],
+    { gear: gearOn(8, 22.5) }
+  );
+  assert.equal(r.gear.offsetDeg, 22.5);
+  assert.ok(!r.gear.usable.some((u) => u.deg > 36 - 1e-6 && u.deg < 108 + 1e-6));
+  assert.ok(Math.abs(r.gear.best.deg - 247.5) < 1e-9);
+});
+
+test('computeSeamAvoidance: 间隙并列时默认取角度较小档位', () => {
+  // 禁用 [0,90°] 与 [180°,270°]（W=0, C=400）→ 可行 [90,180]、[270,360]
+  // 4 档 0/90/180/270：90、180、270 为边界档（间隙 0）→ 并列取 90°
+  const r = computeSeamAvoidance(
+    400,
+    0,
+    [
+      { start: 0, end: 100 },
+      { start: 200, end: 300 },
+    ],
+    { gear: gearOn(4) }
+  );
+  assert.deepEqual(r.gear.usable.map((u) => u.deg), [90, 180, 270]);
+  assert.equal(r.gear.best.deg, 90);
+
+  // 2 档偏移 50°：50° 与 230° 都在禁用区 → 无可用档位但连续有解
+  const r2 = computeSeamAvoidance(
+    400,
+    0,
+    [
+      { start: 0, end: 100 },
+      { start: 200, end: 300 },
+    ],
+    { gear: gearOn(2, 50) }
+  );
+  assert.equal(r2.noSolution, false);
+  assert.equal(r2.gear.usable.length, 0);
+  assert.equal(r2.gear.best, null);
+  assert.ok(r2.gear.nearest);
+  // 50° 距可行段起点 90° 为 40°（before）；50°（抬起 410）距可行段末端 360 为 50°（after）
+  assert.equal(r2.gear.nearest.before.deg, 50);
+  assert.ok(Math.abs(r2.gear.nearest.before.distanceDeg - 40) < 1e-9);
+  assert.equal(r2.gear.nearest.before.boundaryDeg, 90);
+  assert.equal(r2.gear.nearest.after.deg, 50);
+  assert.ok(Math.abs(r2.gear.nearest.after.distanceDeg - 50) < 1e-9);
+  assert.equal(r2.gear.nearest.after.boundaryDeg, 360);
+});
+
+test('computeSeamAvoidance: 整圈可行时全部档位可用，无禁用边界', () => {
+  const r = computeSeamAvoidance(400, 20, [], { gear: gearOn(12, 15) });
+  assert.equal(r.gear.usable.length, 12);
+  assert.equal(r.gear.best.deg, 15);
+  assert.equal(r.gear.best.gapDeg, null);
+  assert.equal(r.gear.usable[0].mm, (15 / 360) * 400);
+});
+
+test('computeSeamAvoidance: 整圈禁用时给出理论档位但无默认/最近档', () => {
+  const r = computeSeamAvoidance(
+    400,
+    50,
+    [
+      { start: 0, end: 180 },
+      { start: 150, end: 400 },
+    ],
+    { gear: gearOn(6) }
+  );
+  assert.equal(r.noSolution, true);
+  assert.equal(r.gear.usable.length, 0);
+  assert.equal(r.gear.best, null);
+  assert.equal(r.gear.nearest, null);
+  assert.equal(r.gear.positions, 6);
+  assert.equal(r.gear.allGears.length, 6);
+  assert.deepEqual(r.gear.allGears.map((x) => x.deg), [0, 60, 120, 180, 240, 300]);
+});

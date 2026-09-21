@@ -46,6 +46,7 @@
         circumference: input.circumference,
         seamWidth: input.seamWidth,
         zones: (input.zones || []).map((z) => ({ start: z.start, end: z.end })),
+        gear: input.gear || null,
       },
       result,
     };

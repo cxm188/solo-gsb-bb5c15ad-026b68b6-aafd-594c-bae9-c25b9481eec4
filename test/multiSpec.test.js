@@ -234,3 +234,123 @@ test('computeMultiSpec: 8 个规格可正常求交，接缝加宽会缩小公共
   const wideWidth = Math.max(...wide.common.map((a) => a.widthDeg));
   assert.ok(wideWidth < thinWidth);
 });
+
+/* ---------------- 设备档位约束 ---------------- */
+
+const gearOn = (positions, offsetDeg = 0) => ({ positions, offsetDeg });
+
+test('computeMultiSpec: 未启用档位时 gear 为 null', () => {
+  const r = computeMultiSpec([400, 200], 20, [{ start: 60, end: 120 }]);
+  assert.equal(r.gear, null);
+});
+
+test('computeMultiSpec: 档位与公共段相交，默认档最大化各规格瓶颈间隙', () => {
+  // 公共可行 216°→36°（宽 180°）；4 档 0/90/180/270：0°、270° 可用
+  // 0°：规格0间隙 36°（边界 36）、规格1间隙 72°（边界 72）→ 瓶颈 36°；
+  // 270°：规格0间隙 126°、规格1间隙 54°（边界 216）→ 瓶颈 54°，故默认 270°
+  const r = computeMultiSpec(
+    [400, 200],
+    20,
+    [{ start: 60, end: 120 }],
+    { gear: gearOn(4) }
+  );
+  assert.equal(r.noSolution, false);
+  assert.deepEqual(r.gear.usable.map((u) => u.deg), [0, 270]);
+  assert.equal(r.gear.best.deg, 270);
+  approx(r.gear.best.gapDeg, 54);
+  // 各规格间隙明细
+  const gaps270 = r.gear.best.gaps;
+  approx(gaps270[0].gapDeg, 126);
+  approx(gaps270[1].gapDeg, 54);
+  assert.equal(gaps270[0].mm, 300); // 270° × 400/360
+  assert.equal(gaps270[1].mm, 150); // 270° × 200/360
+  // 0° 档：规格0 36°、规格1 72°
+  const gaps0 = r.gear.usable[0].gaps;
+  approx(gaps0[0].gapDeg, 36);
+  approx(gaps0[1].gapDeg, 72);
+  assert.equal(r.gear.nearest, null);
+});
+
+test('computeMultiSpec: 偏移旋转档位网格；整圈公共时全部档位可用', () => {
+  const r = computeMultiSpec([400, 200], 0, [], { gear: gearOn(6, 30) });
+  assert.equal(r.fullCircle, true);
+  assert.equal(r.gear.usable.length, 6);
+  assert.deepEqual(r.gear.usable.map((u) => u.deg), [30, 90, 150, 210, 270, 330]);
+  assert.equal(r.gear.best.deg, 30);
+  assert.equal(r.gear.best.gapDeg, null);
+  assert.deepEqual(
+    r.gear.best.gaps.map((g) => g.gapDeg),
+    [null, null]
+  );
+});
+
+test('computeMultiSpec: 公共段有解但无可用档位时给出最近前/后档位', () => {
+  // 两个 C=360 同规格：禁用 [30,180] 与 [207,360]（W=0）
+  // 公共可行弧 [0,30]、[180,207]（连续区间有解）
+  // 2 档偏移 110°：110°、290° 都在禁用区 → 0 档可用
+  const r = computeMultiSpec(
+    [360, 360],
+    0,
+    [
+      { start: 30, end: 180 },
+      { start: 207, end: 360 },
+    ],
+    { gear: gearOn(2, 110) }
+  );
+  assert.equal(r.noSolution, false);
+  assert.equal(r.gear.usable.length, 0);
+  assert.equal(r.gear.best, null);
+  assert.ok(r.gear.nearest);
+  // 110° 距可行段起点 180° 为 70°（before）
+  assert.equal(r.gear.nearest.before.deg, 110);
+  approx(r.gear.nearest.before.distanceDeg, 70);
+  assert.equal(r.gear.nearest.before.boundaryDeg, 180);
+  // 110°（抬起 470）距跨零可行段末端 30°（抬起 390）为 80°（after）
+  assert.equal(r.gear.nearest.after.deg, 110);
+  approx(r.gear.nearest.after.distanceDeg, 80);
+  assert.equal(r.gear.nearest.after.boundaryDeg, 30);
+});
+
+test('computeMultiSpec: 3 档偏移 77° 时仅 317° 档落在公共段内', () => {
+  // 公共可行 216°→36°（宽 180°）
+  const r = computeMultiSpec(
+    [400, 200],
+    20,
+    [{ start: 60, end: 120 }],
+    { gear: gearOn(3, 77) }
+  );
+  assert.equal(r.noSolution, false);
+  assert.deepEqual(r.gear.usable.map((u) => u.deg), [317]);
+  assert.equal(r.gear.best.deg, 317);
+});
+
+test('computeMultiSpec: 无共同解时档位列出但无默认/最近档', () => {
+  const r = computeMultiSpec(
+    [360, 180],
+    0,
+    [
+      { start: 90, end: 180 },
+      { start: 180, end: 360 },
+    ],
+    { gear: gearOn(8) }
+  );
+  assert.equal(r.noSolution, true);
+  assert.equal(r.gear.usable.length, 0);
+  assert.equal(r.gear.best, null);
+  assert.equal(r.gear.nearest, null);
+  assert.equal(r.gear.positions, 8);
+  assert.equal(r.gear.allGears.length, 8);
+});
+
+test('computeMultiSpec: 档位边界点（间隙 0）计为可用', () => {
+  // 公共段 216°→36°；2 档偏移 36°：36°（边界，可用）、216°（边界，可用）
+  const r = computeMultiSpec(
+    [400, 200],
+    20,
+    [{ start: 60, end: 120 }],
+    { gear: gearOn(2, 36) }
+  );
+  assert.deepEqual(r.gear.usable.map((u) => u.deg), [36, 216]);
+  assert.ok(r.gear.usable.every((u) => u.gapDeg === 0));
+  assert.equal(r.gear.best.deg, 36); // 并列取小角
+});

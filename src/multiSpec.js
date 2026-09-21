@@ -18,6 +18,7 @@
  */
 
 const { computeSeamAvoidance } = require('./seamMath');
+const GearPositions = require('./gearPositions');
 
 const FULL = 360;
 const EPS = 1e-7; // 角度比较容差
@@ -222,8 +223,11 @@ function buildBlocker(spec, prior, forbidden) {
  * @param {number[]} circumferences 2～8 个周长 (mm)
  * @param {number} seamWidth 共用接缝安全宽度 (mm)
  * @param {Array<{start:number,end:number}>} zones 共用印刷保护区 (mm)
+ * @param {object} [options]
+ * @param {null|{positions:number, offsetDeg:number}} [options.gear]
+ *   设备档位约束（已校验）；null/缺省表示不启用
  */
-function computeMultiSpec(circumferences, seamWidth, zones) {
+function computeMultiSpec(circumferences, seamWidth, zones, options = {}) {
   if (
     !Array.isArray(circumferences) ||
     circumferences.length < MIN_SPECS ||
@@ -234,10 +238,11 @@ function computeMultiSpec(circumferences, seamWidth, zones) {
     );
   }
 
+  const gearOpt = options.gear || null;
   const specs = circumferences.map((C, index) => ({
     index,
     circumference: C,
-    result: computeSeamAvoidance(C, seamWidth, zones),
+    result: computeSeamAvoidance(C, seamWidth, zones, { gear: gearOpt }),
   }));
   const feasibleSets = specs.map((s) => feasibleDegPieces(s.result));
   const forbiddenSets = specs.map((s) => forbiddenDegPieces(s.result));
@@ -313,9 +318,53 @@ function computeMultiSpec(circumferences, seamWidth, zones) {
     }
   }
 
+  // 设备档位：与共用段相交后离散选档
+  let gear = null;
+  if (gearOpt) {
+    if (blocker) {
+      // 公共交集归零（含整圈禁用）：无可用档位；理论档位仍列出
+      gear = {
+        enabled: true,
+        positions: gearOpt.positions,
+        offsetDeg: mod(gearOpt.offsetDeg, FULL),
+        usable: [],
+        best: null,
+        nearest: null,
+        allGears: Array.from({ length: gearOpt.positions }, (_, i) => ({
+          index: i,
+          deg: GearPositions.gearAngleDeg(i, gearOpt.positions, gearOpt.offsetDeg),
+        })),
+      };
+    } else {
+      const gapsAt = (deg) =>
+        specs.map((s) => {
+          const gap = gapForSpec(deg, s.result);
+          return {
+            index: s.index,
+            circumference: s.circumference,
+            gapDeg: Number.isFinite(gap) ? gap : null,
+            mm: (deg / FULL) * s.circumference,
+          };
+        });
+
+      gear = GearPositions.evaluateGears({
+        positions: gearOpt.positions,
+        offsetDeg: gearOpt.offsetDeg,
+        feasiblePieces: acc,
+        gapAtDeg: (deg) => {
+          const vals = specs.map((s) => gapForSpec(deg, s.result));
+          return vals.every((v) => !Number.isFinite(v)) ? Infinity : Math.min(...vals);
+        },
+        extraAtDeg: gapsAt,
+        extraKey: 'gaps',
+      });
+    }
+  }
+
   return {
     mode: 'multi',
     seamWidth,
+    gear,
     specs,
     common,
     fullCircle,
