@@ -85,10 +85,47 @@ function readZones() {
   }));
 }
 
+/** 读取设备档位约束（单/多规格共用；关闭时只回传 enabled:false，输入仍保留在表单）。 */
+function readDetents() {
+  if (!$('detentsEnabled').checked) return { enabled: false };
+  const offsetRaw = $('detentOffset').value.trim();
+  return {
+    enabled: true,
+    steps: parseInt($('detentSteps').value, 10),
+    offsetDeg: offsetRaw === '' ? 0 : parseFloat($('detentOffset').value),
+  };
+}
+
+/** 档位参数的前端校验，返回错误信息或 null。 */
+function validateDetentsInput(d) {
+  if (!d.enabled) return null;
+  if (!Number.isInteger(d.steps) || d.steps < 2 || d.steps > 360) {
+    return '每圈档位数必须为 2～360 的整数';
+  }
+  if (!Number.isFinite(d.offsetDeg)) {
+    return '零位偏移必须为数值（角度）';
+  }
+  return null;
+}
+
+/** 将档位参数写回表单（载入快照时使用）。 */
+function fillDetents(d) {
+  const enabled = !!(d && d.enabled);
+  $('detentsEnabled').checked = enabled;
+  if (d && Number.isFinite(d.steps)) $('detentSteps').value = d.steps;
+  if (d && Number.isFinite(d.offsetDeg)) $('detentOffset').value = d.offsetDeg;
+  updateDetentsUI();
+}
+
+function updateDetentsUI() {
+  const enabled = $('detentsEnabled').checked;
+  $('detentsFields').hidden = !enabled;
+}
+
 function readInputs() {
   const circumference = parseFloat($('circumference').value);
   const seamWidth = parseFloat($('seamWidth').value);
-  return { circumference, seamWidth, zones: readZones() };
+  return { circumference, seamWidth, zones: readZones(), detents: readDetents() };
 }
 
 function readMultiInputs() {
@@ -96,7 +133,7 @@ function readMultiInputs() {
     parseFloat(i.value)
   );
   const seamWidth = parseFloat($('seamWidth').value);
-  return { circumferences, seamWidth, zones: readZones() };
+  return { circumferences, seamWidth, zones: readZones(), detents: readDetents() };
 }
 
 /* ---------------- 模式切换（两个表单都保留在 DOM，互不丢输入） ---------------- */
@@ -112,8 +149,7 @@ function setMode(mode) {
   $('singleResults').hidden = mode !== 'single';
   $('multiResults').hidden = mode !== 'multi';
   $('multiLegend').hidden = mode !== 'multi';
-  $('previewHint').textContent =
-    mode === 'multi' ? '拖动圆盘旋转，自动吸附到所有规格均安全的最近角度' : '拖动圆盘旋转，自动吸附到最近可行位置';
+  updatePreviewHint();
 
   if (mode === 'multi' && $('specs').children.length === 0) {
     const c = parseFloat($('circumference').value);
@@ -128,6 +164,19 @@ function setMode(mode) {
 /* ---------------- 计算 ---------------- */
 
 let computeTimer = null;
+
+/** 拖动提示随模式与档位约束变化。 */
+function updatePreviewHint() {
+  const detentsOn = $('detentsEnabled').checked;
+  $('previewHint').textContent = state.mode === 'multi'
+    ? detentsOn
+      ? '拖动圆盘旋转，仅吸附到所有规格均安全的可用档位'
+      : '拖动圆盘旋转，自动吸附到所有规格均安全的最近角度'
+    : detentsOn
+      ? '拖动圆盘旋转，仅吸附到可行段内的可用档位'
+      : '拖动圆盘旋转，自动吸附到最近可行位置';
+}
+
 function scheduleCompute() {
   clearTimeout(computeTimer);
   computeTimer = setTimeout(compute, 250);
@@ -148,6 +197,8 @@ async function compute() {
   if (body.zones.some((z) => !Number.isFinite(z.start) || !Number.isFinite(z.end))) {
     return showError('保护区的起点与终点必须为数值 (mm)');
   }
+  const detentsError = validateDetentsInput(body.detents);
+  if (detentsError) return showError(detentsError);
 
   let result;
   try {
@@ -164,7 +215,7 @@ async function compute() {
 
   state.result = result;
   state.lastInput = body;
-  // 默认选择：距禁用边界最远、角度最小的旋转量
+  // 默认选择：距禁用边界最远、角度最小的旋转量；启用档位时为最优可用档位
   if (result.best) state.thetaMm = result.best.mm;
   exitDiffMode();
   renderResults();
@@ -186,6 +237,8 @@ async function computeMulti() {
   if (body.zones.some((z) => !Number.isFinite(z.start) || !Number.isFinite(z.end))) {
     return showError('保护区的起点与终点必须为数值 (mm)');
   }
+  const detentsError = validateDetentsInput(body.detents);
+  if (detentsError) return showError(detentsError);
 
   let result;
   try {
@@ -213,6 +266,55 @@ function showError(msg) {
   $('error').hidden = false;
 }
 
+/* ---------------- 档位结果辅助 ---------------- */
+
+/** 角度 deg 是否落在弧 arc 内（含边界）。 */
+function degInArc(deg, arc) {
+  if (!arc || arc.full) return true;
+  if (arc.wraps) return deg >= arc.startDeg - 1e-9 || deg <= arc.endDeg + 1e-9;
+  return deg >= arc.startDeg - 1e-9 && deg <= arc.endDeg + 1e-9;
+}
+
+/** 弧内可用档位中按“瓶颈间隙最大、角度较小”选出的档位。 */
+function bestDetentInArc(detents, arc) {
+  if (!detents || !detents.available) return null;
+  const list = detents.available.filter((d) => degInArc(d.deg, arc));
+  if (list.length === 0) return null;
+  list.sort((a, b) => {
+    const ga = a.gapDeg !== undefined ? a.gapDeg : a.minGapDeg;
+    const gb = b.gapDeg !== undefined ? b.gapDeg : b.minGapDeg;
+    if (ga === null && gb === null) return a.deg - b.deg;
+    if (ga === null) return -1;
+    if (gb === null) return 1;
+    if (Math.abs(ga - gb) > 1e-7) return gb - ga;
+    return a.deg - b.deg;
+  });
+  return list[0];
+}
+
+/** “无可用档位”提示：列出每条可行/共用段前后最近的档位及角距离。 */
+function renderNearestHtml(detents) {
+  const parts = [
+    `<strong>连续区间有解，但没有任何档位落在可行范围内。</strong>` +
+      `（每圈 ${detents.steps} 档，间隔 ${fmtDeg(detents.stepDeg)}°）`,
+  ];
+  for (const n of detents.nearest || []) {
+    const arcText = n.arc.full
+      ? '0.0° → 360.0°'
+      : `${fmtDeg(n.arc.startDeg)}° → ${fmtDeg(n.arc.endDeg)}°${n.arc.wraps ? '（跨零点）' : ''}`;
+    const side = (label, x) =>
+      x
+        ? `${label}第 ${x.index + 1} 档 ${fmtDeg(x.deg)}°，角距离 ${fmtDeg(x.distanceDeg)}°`
+        : `${label}无`;
+    parts.push(
+      `<div class="chain-item">可行段 ${arcText}：<br>` +
+        `&nbsp;&nbsp;${side('逆时针最近（段前）：', n.before)}<br>` +
+        `&nbsp;&nbsp;${side('顺时针最近（段后）：', n.after)}</div>`
+    );
+  }
+  return parts.join('');
+}
+
 /* ---------------- 结果渲染 ---------------- */
 
 function segText(s) {
@@ -227,15 +329,37 @@ function segText(s) {
 
 function renderResults() {
   const r = state.result;
+  const detentsOn = !!(r.detents && r.detents.enabled);
 
   const bestBox = $('bestBox');
   if (r.best) {
     bestBox.hidden = false;
-    bestBox.innerHTML =
-      `默认旋转量（距禁用边界最远、角度最小）：<br>` +
-      `<span class="num">${fmtDeg(r.best.deg)}°</span> ＝ ${fmtMm(r.best.mm)} mm`;
+    if (detentsOn) {
+      const d = r.detents.best;
+      const gapLine = d.gapDeg === null
+        ? '无禁用区，瓶颈间隙无约束'
+        : `瓶颈间隙 ${fmtDeg(d.gapDeg)}°`;
+      bestBox.innerHTML =
+        `默认档位（可用档位中瓶颈间隙最大、角度最小）：<br>` +
+        `<span class="num">${fmtDeg(r.best.deg)}°</span> ＝ ${fmtMm(r.best.mm)} mm` +
+        ` ｜ 第 ${d.index + 1}/${r.detents.steps} 档 ｜ ${gapLine}`;
+    } else {
+      bestBox.innerHTML =
+        `默认旋转量（距禁用边界最远、角度最小）：<br>` +
+        `<span class="num">${fmtDeg(r.best.deg)}°</span> ＝ ${fmtMm(r.best.mm)} mm`;
+    }
   } else {
     bestBox.hidden = true;
+  }
+
+  // 连续有解但没有可用档位：区别于保护区覆盖整圈
+  const warnBox = $('detentWarnBox');
+  if (detentsOn && !r.noSolution && r.detents.noAvailable) {
+    warnBox.hidden = false;
+    warnBox.innerHTML = renderNearestHtml(r.detents);
+  } else {
+    warnBox.hidden = true;
+    warnBox.innerHTML = '';
   }
 
   $('noSolutionBox').hidden = !r.noSolution;
@@ -249,6 +373,8 @@ function renderResults() {
       .join('');
   }
 
+  renderSingleDetents();
+
   $('feasibleCount').textContent = r.noSolution ? '（无）' : `（共 ${r.feasible.length} 段）`;
   const fl = $('feasibleList');
   fl.innerHTML = '';
@@ -256,12 +382,18 @@ function renderResults() {
     const li = document.createElement('li');
     li.className = 'feasible';
     li.innerHTML = `<span>段 ${i + 1}：${segText(s)}</span><span class="tag">宽 ${fmtDeg(s.widthDeg)}°</span>`;
-    li.title = '点击将该段中点设为接缝位置';
+    li.title = detentsOn ? '点击选择该段内的默认可用档位' : '点击将该段中点设为接缝位置';
     li.addEventListener('click', () => {
       const C = r.circumference;
-      const sMm = s.startMm;
-      const eMm = s.wraps ? s.endMm + C : s.endMm;
-      state.thetaMm = mod((sMm + eMm) / 2, C);
+      if (detentsOn) {
+        const pick = bestDetentInArc(r.detents, s);
+        if (!pick) return; // 该段无可用档位
+        state.thetaMm = pick.mm;
+      } else {
+        const sMm = s.startMm;
+        const eMm = s.wraps ? s.endMm + C : s.endMm;
+        state.thetaMm = mod((sMm + eMm) / 2, C);
+      }
       renderResults();
       draw();
     });
@@ -280,6 +412,43 @@ function renderResults() {
       li.innerHTML = `<span>禁用 ${i + 1}：${segText(s)}</span>`;
       dl.appendChild(li);
     });
+  }
+}
+
+/** 单规格：渲染可用档位列表（含各档间隙）。 */
+function renderSingleDetents() {
+  const r = state.result;
+  const panel = $('singleDetentsPanel');
+  if (!r || !r.detents || !r.detents.enabled) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const d = r.detents;
+  $('singleDetentCount').textContent = r.noSolution
+    ? '（保护区覆盖整圈）'
+    : d.noAvailable
+      ? '（无可用档位）'
+      : `（${d.available.length}/${d.steps} 档可用，间隔 ${fmtDeg(d.stepDeg)}°）`;
+
+  const ul = $('singleDetentList');
+  ul.innerHTML = '';
+  if (r.noSolution) return;
+  for (const item of d.available) {
+    const li = document.createElement('li');
+    li.className = 'detent-row';
+    if (r.best && item.index === r.best.detentIndex) li.classList.add('active');
+    const gap = item.gapDeg === null ? '无禁用区' : `间隙 ${fmtDeg(item.gapDeg)}°`;
+    li.innerHTML =
+      `<span class="d-name">第 ${item.index + 1} 档：${fmtDeg(item.deg)}°（${fmtMm(item.mm)} mm）</span>` +
+      `<span class="tag">${gap}</span>`;
+    li.title = '点击将接缝移到该档位';
+    li.addEventListener('click', () => {
+      state.thetaMm = item.mm;
+      renderResults();
+      draw();
+    });
+    ul.appendChild(li);
   }
 }
 
@@ -314,15 +483,17 @@ function renderMultiResults() {
 
   if (!r.noSolution && r.best) {
     let line = '';
+    const detentsOn = !!(r.detents && r.detents.enabled);
+    const detentTag = detentsOn ? ` ｜ 第 ${r.best.detentIndex + 1}/${r.detents.steps} 档` : '';
     if (r.best.minGapDeg === null) {
       line =
-        `默认共用角度（所有规格均无禁用区，取最小角度）：<br>` +
-        `<span class="num">${fmtDeg(r.best.deg)}°</span>`;
+        `${detentsOn ? '默认档位' : '默认共用角度'}（所有规格均无禁用区，取最小角度）：<br>` +
+        `<span class="num">${fmtDeg(r.best.deg)}°</span>${detentTag}`;
     } else {
       const tight = r.specs[r.best.minGapSpecIndex];
       line =
-        `默认共用角度（各规格下距禁用边界的最小间隙最大）：<br>` +
-        `<span class="num">${fmtDeg(r.best.deg)}°</span>` +
+        `${detentsOn ? '默认档位' : '默认共用角度'}（各规格下距禁用边界的最小间隙最大）：<br>` +
+        `<span class="num">${fmtDeg(r.best.deg)}°</span>${detentTag}` +
         ` ｜ 最小间隙 ${fmtDeg(r.best.minGapDeg)}°（规格 ${r.best.minGapSpecIndex + 1}：${
           tight ? fmtMm(tight.circumference) : ''
         } mm）`;
@@ -336,6 +507,16 @@ function renderMultiResults() {
       line += `<div class="gap-detail">${per}</div>`;
     }
     bestBox.innerHTML = line;
+  }
+
+  // 连续公共段有解但没有可用档位
+  const warnBox = $('multiDetentWarnBox');
+  if (!r.noSolution && r.detents && r.detents.enabled && r.detents.noAvailable) {
+    warnBox.hidden = false;
+    warnBox.innerHTML = renderNearestHtml(r.detents);
+  } else {
+    warnBox.hidden = true;
+    warnBox.innerHTML = '';
   }
 
   if (r.noSolution && r.blocker) {
@@ -366,9 +547,15 @@ function renderMultiResults() {
       li.innerHTML = a.full
         ? `<span>整圈：0.0° → 360.0°</span><span class="tag">宽 360.0°</span>`
         : `<span>共用段：${arcText(a)}</span><span class="tag">宽 ${fmtDeg(a.widthDeg)}°</span>`;
-      li.title = '点击将该段中点设为共用角度';
+      li.title = r.detents && r.detents.enabled ? '点击选择该段内的默认可用档位' : '点击将该段中点设为共用角度';
       li.addEventListener('click', () => {
-        state.thetaDeg = a.full ? 0 : mod((a.startDeg + (a.wraps ? a.endDeg + 360 : a.endDeg)) / 2, 360);
+        if (r.detents && r.detents.enabled) {
+          const pick = bestDetentInArc(r.detents, a);
+          if (!pick) return;
+          state.thetaDeg = pick.deg;
+        } else {
+          state.thetaDeg = a.full ? 0 : mod((a.startDeg + (a.wraps ? a.endDeg + 360 : a.endDeg)) / 2, 360);
+        }
         renderMultiResults();
         draw();
       });
@@ -376,6 +563,7 @@ function renderMultiResults() {
     }
   }
   markActiveCommon();
+  renderMultiDetents();
 
   const sl = $('multiSpecList');
   sl.innerHTML = '';
@@ -415,6 +603,51 @@ function markActiveCommon() {
   });
 }
 
+/** 多规格：渲染可用档位列表（逐档列出各规格间隙）。 */
+function renderMultiDetents() {
+  const r = state.multiResult;
+  const panel = $('multiDetentsPanel');
+  if (!r || !r.detents || !r.detents.enabled) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const d = r.detents;
+  $('multiDetentCount').textContent = r.noSolution
+    ? '（公共交集归零）'
+    : d.noAvailable
+      ? '（无可用档位）'
+      : `（${d.available.length}/${d.steps} 档可用，间隔 ${fmtDeg(d.stepDeg)}°）`;
+
+  const ul = $('multiDetentList');
+  ul.innerHTML = '';
+  if (r.noSolution) return;
+  for (const item of d.available) {
+    const li = document.createElement('li');
+    li.className = 'detent-row';
+    if (r.best && item.index === r.best.detentIndex) li.classList.add('active');
+    const per = item.gaps
+      .map(
+        (g) =>
+          `规格${g.index + 1}：${g.gapDeg === null ? '无禁用区' : fmtDeg(g.gapDeg) + '°'}`
+      )
+      .join(' ｜ ');
+    const bottleneck =
+      item.minGapDeg === null ? '无禁用区' : `瓶颈 ${fmtDeg(item.minGapDeg)}°`;
+    li.innerHTML =
+      `<div class="md-head"><span class="d-name">第 ${item.index + 1} 档：${fmtDeg(item.deg)}°</span>` +
+      `<span class="tag">${bottleneck}</span></div>` +
+      `<div class="md-gaps">${per}</div>`;
+    li.title = '点击将共用角度移到该档位';
+    li.addEventListener('click', () => {
+      state.thetaDeg = item.deg;
+      renderMultiResults();
+      draw();
+    });
+    ul.appendChild(li);
+  }
+}
+
 function renderMultiLegend() {
   const r = state.multiResult;
   const el = $('multiLegend');
@@ -442,7 +675,7 @@ function renderMultiLegend() {
 
 /* ---------------- 吸附 ---------------- */
 
-/** 将角度 m (mm) 吸附到最近可行位置；无解时返回 null */
+/** 将角度 m (mm) 吸附到最近可行位置；无解时返回 null。启用档位时仅吸附到可用档位。 */
 function snapToFeasible(m) {
   const r = state.result;
   if (!r || r.noSolution) return null;
@@ -454,6 +687,25 @@ function snapToFeasible(m) {
       const e = s.wraps ? s.endMm + C : s.endMm;
       return (x >= s.startMm && x <= e) || (x + C >= s.startMm && x + C <= e);
     });
+
+  // 设备档位约束：只能落在可用档位上，取圆周距离最近（并列取较小角度）
+  if (r.detents && r.detents.enabled) {
+    if (r.detents.noAvailable || r.detents.available.length === 0) return null;
+    let best = null;
+    for (const d of r.detents.available) {
+      const cand = d.mm;
+      const diff = Math.abs(cand - m);
+      const dist = Math.min(diff, C - diff);
+      if (
+        !best ||
+        dist < best.dist - 1e-9 ||
+        (Math.abs(dist - best.dist) <= 1e-9 && cand < best.v)
+      ) {
+        best = { dist, v: cand };
+      }
+    }
+    return best ? best.v : null;
+  }
 
   if (inGap(m)) return m;
 
@@ -468,10 +720,30 @@ function snapToFeasible(m) {
   return best ? best.v : null;
 }
 
-/** 多规格：将角度吸附到最近的共用安全段；无共同解返回 null。 */
+/** 多规格：将角度吸附到最近的共用安全段；无共同解返回 null。启用档位时仅吸附可用档位。 */
 function snapToCommon(m) {
   const r = state.multiResult;
   if (!r || r.noSolution) return null;
+
+  // 设备档位约束
+  if (r.detents && r.detents.enabled) {
+    if (r.detents.noAvailable || r.detents.available.length === 0) return null;
+    let best = null;
+    for (const d of r.detents.available) {
+      const cand = d.deg;
+      const diff = Math.abs(cand - m);
+      const dist = Math.min(diff, 360 - diff);
+      if (
+        !best ||
+        dist < best.dist - 1e-9 ||
+        (Math.abs(dist - best.dist) <= 1e-9 && cand < best.v)
+      ) {
+        best = { dist, v: cand };
+      }
+    }
+    return best ? best.v : null;
+  }
+
   if (r.fullCircle) return m;
 
   const inArc = (x, a) =>
@@ -500,6 +772,67 @@ function geom() {
   }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return { cx: size / 2, cy: size / 2, R: 170, size };
+}
+
+/**
+ * 绘制设备档位刻度（角度域，单/多规格共用）。
+ * 可用档位绿色长刻度；无可用档位时，最近档位琥珀色，其余灰色短刻度。
+ * @param {object} det 结果中的 detents 对象
+ * @param {number} ringR 最外侧环半径（刻度画在其外）
+ */
+function drawDetentTicks(c, cx, cy, det, ringR) {
+  if (!det || !det.enabled) return;
+  const availSet = new Set((det.available || []).map((d) => d.index));
+  const nearSet = new Set();
+  (det.nearest || []).forEach((n) => {
+    if (n.before) nearSet.add(n.before.index);
+    if (n.after) nearSet.add(n.after.index);
+  });
+  const radDeg = (deg) => (deg / 360) * TAU - Math.PI / 2;
+  det.positions.forEach((deg, index) => {
+    const a = radDeg(deg);
+    const available = availSet.has(index);
+    const near = nearSet.has(index);
+    const r0 = ringR + 24;
+    const r1 = available ? ringR + 32 : ringR + 29;
+    c.beginPath();
+    c.moveTo(cx + r0 * Math.cos(a), cy + r0 * Math.sin(a));
+    c.lineTo(cx + r1 * Math.cos(a), cy + r1 * Math.sin(a));
+    c.strokeStyle = available
+      ? '#0f7a3d'
+      : near
+        ? '#d97706'
+        : '#c4c9d2';
+    c.lineWidth = available ? 2.2 : 1.2;
+    c.stroke();
+  });
+}
+
+/** 无可用档位时，在距可行段最近的前后档位画琥珀色菱形标记。 */
+function drawNearestDetentMarkers(c, cx, cy, det, rMark) {
+  if (!det || !det.enabled || !det.noAvailable) return;
+  const radDeg = (deg) => (deg / 360) * TAU - Math.PI / 2;
+  const drawMark = (deg) => {
+    const a = radDeg(deg);
+    const x = cx + rMark * Math.cos(a);
+    const y = cy + rMark * Math.sin(a);
+    c.save();
+    c.translate(x, y);
+    c.rotate(a + Math.PI / 2);
+    c.fillStyle = '#d97706';
+    c.beginPath();
+    c.moveTo(0, -5);
+    c.lineTo(4, 0);
+    c.lineTo(0, 5);
+    c.lineTo(-4, 0);
+    c.closePath();
+    c.fill();
+    c.restore();
+  };
+  for (const n of det.nearest || []) {
+    if (n.before) drawMark(n.before.deg);
+    if (n.after) drawMark(n.after.deg);
+  }
 }
 
 /** 我们的角度约定：0° 在正上方，顺时针为正；转为 canvas 弧度 */
@@ -570,6 +903,12 @@ function drawSingle() {
     drawRingSegments(cx, cy, R, r.forbiddenMerged, C, '#d43a3a', 20);
   }
 
+  // 设备档位刻度（环外）与“无可用档位”时的最近档位标记
+  drawDetentTicks(ctx, cx, cy, r.detents, R);
+  if (r.detents && r.detents.enabled && !r.noSolution && r.detents.noAvailable) {
+    drawNearestDetentMarkers(ctx, cx, cy, r.detents, R + 12);
+  }
+
   // 印刷保护区（内环）
   const zoneSegs = [];
   for (const pieces of r.zonePieces) {
@@ -587,11 +926,18 @@ function drawSingle() {
   ctx.moveTo(cx, cy);
   ctx.arc(cx, cy, R - 46, a0, a1, false);
   ctx.closePath();
-  ctx.fillStyle = r.noSolution ? 'rgba(212,58,58,0.18)' : 'rgba(37,99,235,0.18)';
+  // 接缝位置线（先计算是否为可用档位，供扇形与位置线着色）
+  const thetaOnAvailable =
+    !r.detents || !r.detents.enabled ||
+    r.detents.available.some((d) => Math.abs(d.mm - theta) <= C * 1e-7);
+  ctx.fillStyle = r.noSolution
+    ? 'rgba(212,58,58,0.18)'
+    : thetaOnAvailable
+      ? 'rgba(37,99,235,0.18)'
+      : 'rgba(217,119,6,0.18)';
   ctx.fill();
 
-  // 接缝位置线
-  ctx.strokeStyle = r.noSolution ? '#d43a3a' : '#2563eb';
+  ctx.strokeStyle = r.noSolution ? '#d43a3a' : thetaOnAvailable ? '#2563eb' : '#d97706';
   ctx.lineWidth = 3;
   ctx.beginPath();
   ctx.moveTo(cx + (R - 46) * Math.cos(a0), cy + (R - 46) * Math.sin(a0));
@@ -612,8 +958,8 @@ function drawSingle() {
     ctx.restore();
   }
 
-  // 最优位置标记
-  if (r.best) {
+  // 最优位置标记（启用档位但无可用档位时不显示连续最优点）
+  if (r.best && !(r.detents && r.detents.enabled && r.detents.noAvailable)) {
     const ab = rad(r.best.mm, C);
     const bx = cx + (R + 10) * Math.cos(ab);
     const by = cy + (R + 10) * Math.sin(ab);
@@ -644,9 +990,14 @@ function drawSingle() {
   }
 
   // 图例
-  const legend = r.noSolution
+  const detentsOn = !!(r.detents && r.detents.enabled);
+  let legend = r.noSolution
     ? [['#d43a3a', '禁用（覆盖整圈）'], ['#e8912d', '印刷保护区']]
     : [['#1e9e50', '可行'], ['#d43a3a', '禁用'], ['#e8912d', '印刷保护区'], ['#2563eb', '接缝']];
+  if (detentsOn && !r.noSolution) {
+    legend.push(['#0f7a3d', '可用档位']);
+    if (r.detents.noAvailable) legend.push(['#d97706', '最近档位']);
+  }
   ctx.font = '12px sans-serif';
   ctx.textAlign = 'left';
   let lx = 16;
@@ -662,8 +1013,19 @@ function drawSingle() {
   const deg = fmtDeg((theta / C) * 360);
   $('currentPos').textContent = r.noSolution
     ? '当前无可行位置：请缩小接缝宽度或调整保护区'
-    : `当前接缝位置：${deg}°（${fmtMm(theta)} mm）`;
+    : detentsOn && r.detents.noAvailable
+      ? '连续区间有解，但无可用档位：灰色为全部档位，琥珀色为距可行段最近的档位'
+      : detentsOn
+        ? `当前接缝位置（第 ${currentSingleDetentLabel(r)} 档）：${deg}°（${fmtMm(theta)} mm）`
+        : `当前接缝位置：${deg}°（${fmtMm(theta)} mm）`;
   markActiveSegment();
+}
+
+/** 当前接缝位置对应的档位序号文本（若非可用档位返回 “—”）。 */
+function currentSingleDetentLabel(r) {
+  const deg = (state.thetaMm / r.circumference) * 360;
+  const hit = (r.detents.available || []).find((d) => Math.abs(d.deg - deg) <= 1e-7);
+  return hit ? `${hit.index + 1}/${r.detents.steps}` : '—';
 }
 
 /* ---------------- 多规格 Canvas ---------------- */
@@ -770,11 +1132,20 @@ function drawMulti() {
     });
   }
 
+  // 设备档位刻度（最外侧禁用环之外）与“无可用档位”最近标记
+  drawDetentTicks(ctx, cx, cy, r.detents, outR);
+  if (!r.noSolution && r.detents && r.detents.enabled && r.detents.noAvailable) {
+    drawNearestDetentMarkers(ctx, cx, cy, r.detents, outR + 12);
+  }
+
   // 当前共用角度位置线
   if (!r.noSolution) {
     const theta = state.thetaDeg;
+    const onAvailable =
+      !r.detents || !r.detents.enabled ||
+      r.detents.available.some((d) => Math.abs(d.deg - theta) <= 1e-7);
     const a = multiRadDeg(theta);
-    ctx.strokeStyle = '#2563eb';
+    ctx.strokeStyle = onAvailable ? '#2563eb' : '#d97706';
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(cx + (commonR - 10) * Math.cos(a), cy + (commonR - 10) * Math.sin(a));
@@ -845,10 +1216,21 @@ function drawMulti() {
     }
   }
 
+  const detentsOn = !!(r.detents && r.detents.enabled);
   $('currentPos').textContent = r.noSolution
     ? '当前无所有规格均安全的共用角度'
-    : `当前共用角度：${fmtDeg(state.thetaDeg)}°`;
+    : detentsOn && r.detents.noAvailable
+      ? '共用段连续有解，但无可用档位：灰色为全部档位，琥珀色为距共用段最近的档位'
+      : detentsOn
+        ? `当前共用角度（第 ${currentMultiDetentLabel(r)} 档）：${fmtDeg(state.thetaDeg)}°`
+        : `当前共用角度：${fmtDeg(state.thetaDeg)}°`;
   markActiveCommon();
+}
+
+/** 当前共用角度对应的档位序号文本（若非可用档位返回 “—”）。 */
+function currentMultiDetentLabel(r) {
+  const hit = (r.detents.available || []).find((d) => Math.abs(d.deg - state.thetaDeg) <= 1e-7);
+  return hit ? `${hit.index + 1}/${r.detents.steps}` : '—';
 }
 
 /** 统一绘制入口：按当前模式分发。 */
@@ -954,7 +1336,9 @@ function snapshotMetaText(s) {
   const i = s.input;
   const zones = `${i.zones.length} 个保护区`;
   const noSol = s.result && s.result.noSolution ? ' · 无解' : '';
-  return `${fmtTime(s.createdAt)} ｜ C=${fmtMm(i.circumference)} W=${fmtMm(i.seamWidth)} mm ｜ ${zones}${noSol}`;
+  const det =
+    i.detents && i.detents.enabled ? ` · ${i.detents.steps} 档/偏移 ${fmtDeg(i.detents.offsetDeg)}°` : '';
+  return `${fmtTime(s.createdAt)} ｜ C=${fmtMm(i.circumference)} W=${fmtMm(i.seamWidth)} mm ｜ ${zones}${det}${noSol}`;
 }
 
 function renderSnapshotList() {
@@ -1059,6 +1443,7 @@ function loadSnapshot(id) {
   setMode('single');
   $('circumference').value = s.input.circumference;
   $('seamWidth').value = s.input.seamWidth;
+  fillDetents(s.input.detents);
   $('zones').innerHTML = '';
   for (const z of s.input.zones) addZoneRow(z.start, z.end);
   compute();
@@ -1397,6 +1782,13 @@ document.querySelectorAll('.mode-btn').forEach((btn) => {
 $('compute').addEventListener('click', compute);
 $('circumference').addEventListener('input', scheduleCompute);
 $('seamWidth').addEventListener('input', scheduleCompute);
+$('detentsEnabled').addEventListener('change', () => {
+  updateDetentsUI();
+  updatePreviewHint();
+  scheduleCompute();
+});
+$('detentSteps').addEventListener('input', scheduleCompute);
+$('detentOffset').addEventListener('input', scheduleCompute);
 $('loadExample').addEventListener('click', () => {
   $('seamWidth').value = 20;
   $('zones').innerHTML = '';
@@ -1433,6 +1825,8 @@ $('exitDiff').addEventListener('click', () => {
 renderSnapshotList();
 refreshSpecRows();
 updateSnapshotModeUI();
+updateDetentsUI();
+updatePreviewHint();
 
 // 默认载入示例并计算
 $('loadExample').click();

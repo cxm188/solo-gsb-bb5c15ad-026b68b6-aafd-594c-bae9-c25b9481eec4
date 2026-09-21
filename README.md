@@ -2,6 +2,16 @@
 
 输入筒体周长、接缝安全宽度与若干毫米制印刷保护区，系统按周长归一化跨零点区间、合并禁用旋转范围、列出全部可行角度段，并默认选择距禁用边界最远、角度最小的旋转量。Canvas 同步预览接缝与保护区，拖动时吸附到最近可行位置；无解时展示覆盖整圈的禁用区间链。
 
+## 设备档位约束
+
+在参数面板勾选「启用设备档位约束」（单规格与多规格共用此设置，可分别填写 **每圈档位数 2～360 的整数** 与 **零位偏移 (°)**）：
+
+- 系统只允许角度 `θ = 偏移 + n × 360°/档位数`（按整圈归一到 0°–360°），偏移超出范围自动按整圈归一。
+- 档位与当前**可行段**（单规格）或**共用段**（多规格）求交（边界档位也算可用），默认档位沿用 **「瓶颈间隙最大、角度较小优先」** 规则；右栏列出**全部可用档位**及间隙（单规格为该档到最近禁用边界的角距离；多规格逐规格列出间隙与瓶颈档）。
+- **连续区间有解但没有可用档位**时，与「保护区覆盖整圈」明确区分：结果区给出琥珀色提示，按每条可行/共用段列出**距该段最近的前、后档位**及角距离；Canvas 环外灰色短刻度为全部档位，琥珀色菱形为最近档位。
+- Canvas 拖动**只吸附到可用档位**（圆周距离最近，并列取较小角度），点击可行段则选中该段内的默认可用档位；没有可用档位时位置线变琥珀色且不移动。
+- **关闭约束后行为与此前完全一致**；勾选状态、档位数与偏移在单/多规格模式切换、计算与载入快照时都**保留在表单中**，不会因切换模式丢失。
+
 ## 多规格共用角度模式
 
 顶部切换到「多规格共用角度」后，可输入 **2～8 个筒体周长**，沿用同一接缝安全宽度与同一组毫米制保护区：
@@ -15,7 +25,7 @@
 
 ## 方案快照
 
-- 在「方案快照」面板可为**当前周长、接缝宽度与保护区计算结果**命名并保存；快照按时间倒序列出，支持载入参数与删除。
+- 在「方案快照」面板可为**当前周长、接缝宽度、保护区与设备档位设置的计算结果**命名并保存；快照按时间倒序列出，支持载入参数（含档位开关、档位数与偏移）与删除。
 - 勾选两个快照（依次标记为 A、B）后点击比较：系统将三类圆周区间（保护区、合并禁用段、可行段）统一归一化到 **0°–360°**，即使两个快照周长不同也可比较。
 - 差异输出：
   - **新增**（B 有 A 无，绿色）／**移除**（A 有 B 无，红色）的圆周区间；
@@ -44,9 +54,16 @@ http://localhost:3000
 
 | 方法 & 路径 | 说明 |
 | ----------- | ---- |
-| `POST /api/compute` | 单规格计算。请求体：`{circumference, seamWidth, zones:[{start,end}]}`（单位 mm） |
-| `POST /api/compute-multi` | 多规格共用角度。请求体：`{circumferences:[…2～8 个周长…], seamWidth, zones}`；返回每个规格的完整单规格结果（`specs[].result`）、圆周交集 `common`（角度弧段）、默认角度 `best.deg` 及各规格间隙 `best.gaps`；无共同解时 `noSolution=true` 并给出 `blocker`（首次归零的规格序号、此前公共段 `priorCommon`、该规格禁用段 `blockingForbidden` 与冲突区间 `conflictSegments`） |
+| `POST /api/compute` | 单规格计算。请求体：`{circumference, seamWidth, zones:[{start,end}], detents?}`（单位 mm） |
+| `POST /api/compute-multi` | 多规格共用角度。请求体：`{circumferences:[…2～8 个周长…], seamWidth, zones, detents?}`；返回每个规格的完整单规格结果（`specs[].result`）、圆周交集 `common`（角度弧段）、默认角度 `best.deg` 及各规格间隙 `best.gaps`；无共同解时 `noSolution=true` 并给出 `blocker`（首次归零的规格序号、此前公共段 `priorCommon`、该规格禁用段 `blockingForbidden` 与冲突区间 `conflictSegments`） |
 | `GET /api/health` | 健康检查 |
+
+`detents`（可选）为设备档位约束：`{enabled:true, steps:2～360 的整数, offsetDeg?:数值角度}`；缺省或 `enabled:false` 时行为不变（返回 `detents:{enabled:false}`）。启用后返回：
+
+- `detents.steps / offsetDeg / stepDeg / positions`：档位参数与全部档位角度；
+- `detents.available`：全部可用档位。单规格每项 `{index, deg, mm, gapDeg}`；多规格每项 `{index, deg, minGapDeg, gaps:[各规格间隙]}`；
+- 单规格 `best` 取最优可用档位（附 `detentIndex`）；多规格 `best` 同理；
+- 连续区间有解但无可用档位时 `best=null`、`detents.noAvailable=true`，`detents.nearest[]` 按可行/共用弧给出 `{before, after}`（最近前、后档位及角距离）；保护区覆盖整圈时 `noSolution=true`、`noAvailable=false`。
 
 ## 本地开发（可选）
 

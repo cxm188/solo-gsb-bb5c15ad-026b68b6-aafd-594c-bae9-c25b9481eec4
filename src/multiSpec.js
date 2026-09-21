@@ -18,6 +18,7 @@
  */
 
 const { computeSeamAvoidance } = require('./seamMath');
+const { parseDetents, analyzeDetents } = require('./detents');
 
 const FULL = 360;
 const EPS = 1e-7; // 角度比较容差
@@ -222,8 +223,10 @@ function buildBlocker(spec, prior, forbidden) {
  * @param {number[]} circumferences 2～8 个周长 (mm)
  * @param {number} seamWidth 共用接缝安全宽度 (mm)
  * @param {Array<{start:number,end:number}>} zones 共用印刷保护区 (mm)
+ * @param {object} [detentsOpt] 设备档位约束
+ *        {enabled:boolean, steps?:2～360 整数, offsetDeg?:number}
  */
-function computeMultiSpec(circumferences, seamWidth, zones) {
+function computeMultiSpec(circumferences, seamWidth, zones, detentsOpt) {
   if (
     !Array.isArray(circumferences) ||
     circumferences.length < MIN_SPECS ||
@@ -233,6 +236,7 @@ function computeMultiSpec(circumferences, seamWidth, zones) {
       `circumferences 必须为含 ${MIN_SPECS}～${MAX_SPECS} 个周长的数组`
     );
   }
+  const detentCfg = parseDetents(detentsOpt);
 
   const specs = circumferences.map((C, index) => ({
     index,
@@ -258,6 +262,22 @@ function computeMultiSpec(circumferences, seamWidth, zones) {
   const fullCircle = !blocker && isFullCircle(acc);
 
   let best = null;
+  let detents = detentCfg.enabled
+    ? {
+        enabled: true,
+        steps: detentCfg.steps,
+        offsetDeg: detentCfg.offsetDeg,
+        stepDeg: FULL / detentCfg.steps,
+        positions: Array.from(
+          { length: detentCfg.steps },
+          (_, k) => mod(detentCfg.offsetDeg + (k * FULL) / detentCfg.steps, FULL)
+        ).sort((a, b) => a - b),
+        available: [],
+        best: null,
+        noAvailable: false,
+        nearest: [],
+      }
+    : { enabled: false };
   if (!blocker) {
     const gapsAt = (deg) =>
       specs.map((s) => {
@@ -270,7 +290,67 @@ function computeMultiSpec(circumferences, seamWidth, zones) {
         };
       });
 
-    if (fullCircle) {
+    // 瓶颈间隙：各规格到禁用边界距离的最小值；全部规格均无禁用区时为 null（无约束）
+    const minGapOfGaps = (gaps) => {
+      const finite = gaps.filter((g) => g.gapDeg !== null);
+      return finite.length
+        ? finite.reduce((m, g) => (g.gapDeg < m ? g.gapDeg : m), Infinity)
+        : null;
+    };
+    const minGapSpecOfGaps = (gaps, minGap) => {
+      let idx = null;
+      for (const g of gaps) {
+        if (g.gapDeg !== null && g.gapDeg <= minGap + EPS && (idx === null || g.index < idx)) {
+          idx = g.index;
+        }
+      }
+      return idx;
+    };
+
+    if (detentCfg.enabled) {
+      // 档位与共用段相交；默认档位沿用“瓶颈间隙最大、角度较小优先”
+      const analysis = analyzeDetents(
+        detentCfg,
+        common,
+        (deg) => minGapOfGaps(gapsAt(deg)),
+        gapsAt
+      );
+      detents = {
+        enabled: true,
+        steps: analysis.steps,
+        offsetDeg: analysis.offsetDeg,
+        stepDeg: analysis.stepDeg,
+        positions: analysis.positions,
+        available: analysis.available.map((c) => ({
+          index: c.index,
+          deg: c.deg,
+          minGapDeg: c.minGapDeg,
+          gaps: c.detail,
+        })),
+        best: null,
+        noAvailable: analysis.noAvailable,
+        nearest: analysis.nearest,
+      };
+      if (analysis.best) {
+        const win = analysis.best;
+        detents.best = {
+          index: win.index,
+          deg: win.deg,
+          minGapDeg: win.minGapDeg,
+          minGapSpecIndex:
+            win.minGapDeg === null ? null : minGapSpecOfGaps(win.detail, win.minGapDeg),
+          gaps: win.detail,
+        };
+        best = {
+          deg: win.deg,
+          minGapDeg: win.minGapDeg,
+          minGapSpecIndex: detents.best.minGapSpecIndex,
+          gaps: win.detail,
+          detentIndex: win.index,
+        };
+      }
+      // noAvailable（连续有解但无可用档位）时 best 保持 null
+    } else if (fullCircle) {
       // 所有规格均无禁用区：整圈等距，按“角度最小”取 0
       best = {
         deg: 0,
@@ -284,12 +364,7 @@ function computeMultiSpec(circumferences, seamWidth, zones) {
         const endLifted = arc.wraps ? arc.endDeg + FULL : arc.endDeg;
         const deg = mod((arc.startDeg + endLifted) / 2, FULL);
         const gaps = gapsAt(deg);
-        const finite = gaps.filter((g) => g.gapDeg !== null);
-        // 有解但部分规格无禁用区时，这些规格不构成约束（间隙视为 +∞）
-        const minGap = finite.length
-          ? finite.reduce((m, g) => (g.gapDeg < m ? g.gapDeg : m), Infinity)
-          : null;
-        return { deg, minGap, gaps, width: arc.widthDeg };
+        return { deg, minGap: minGapOfGaps(gaps), gaps, width: arc.widthDeg };
       });
       candidates.sort((x, y) => {
         if (x.minGap === null) return y.minGap === null ? x.deg - y.deg : -1;
@@ -298,16 +373,10 @@ function computeMultiSpec(circumferences, seamWidth, zones) {
         return x.deg - y.deg;
       });
       const win = candidates[0];
-      let minGapSpecIndex = win.gaps[0].index;
-      for (const g of win.gaps) {
-        if (g.gapDeg !== null && g.gapDeg <= win.minGap + EPS && g.index < minGapSpecIndex) {
-          minGapSpecIndex = g.index;
-        }
-      }
       best = {
         deg: win.deg,
         minGapDeg: win.minGap,
-        minGapSpecIndex: win.minGap === null ? null : minGapSpecIndex,
+        minGapSpecIndex: win.minGap === null ? null : minGapSpecOfGaps(win.gaps, win.minGap),
         gaps: win.gaps,
       };
     }
@@ -322,6 +391,7 @@ function computeMultiSpec(circumferences, seamWidth, zones) {
     best,
     noSolution: blocker !== null,
     blocker,
+    detents,
   };
 }
 

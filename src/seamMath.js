@@ -12,6 +12,8 @@
 
 const EPS = 1e-9;
 
+const { parseDetents, buildSingleDetents, circDistDeg, FULL: DEG_FULL } = require('./detents');
+
 function mod(n, m) {
   return ((n % m) + m) % m;
 }
@@ -97,8 +99,10 @@ function computeGaps(merged, C) {
  * @param {number} C 周长 (mm)，> 0
  * @param {number} W 接缝安全宽度 (mm)，>= 0
  * @param {Array<{start: number, end: number}>} zones 印刷保护区 (mm)
+ * @param {object} [detentsOpt] 设备档位约束
+ *        {enabled:boolean, steps?:2～360 整数, offsetDeg?:number}
  */
-function computeSeamAvoidance(C, W, zones) {
+function computeSeamAvoidance(C, W, zones, detentsOpt) {
   const zonePieces = [];
   const rawForbidden = [];
   for (const z of zones) {
@@ -159,6 +163,38 @@ function computeSeamAvoidance(C, W, zones) {
     endDeg: mmToDeg(b, C),
   });
 
+  // 设备档位约束（可启用）：档位与可行段相交，默认档位取“瓶颈间隙最大、角度较小”
+  const detentCfg = parseDetents(detentsOpt);
+  let detents = { enabled: false };
+  if (detentCfg.enabled) {
+    const boundaryDeg = [];
+    for (const [a, b] of merged) {
+      for (const p of [mmToDeg(a, C), mmToDeg(b, C)]) {
+        const q = mod(p, DEG_FULL);
+        if (!boundaryDeg.some((x) => Math.abs(x - q) <= 1e-7 || Math.abs(x - q) >= DEG_FULL - 1e-7)) {
+          boundaryDeg.push(q);
+        }
+      }
+    }
+    const noForbidden = boundaryDeg.length === 0;
+    const gapDegAt = (deg) =>
+      boundaryDeg.reduce((m, p) => Math.min(m, circDistDeg(deg, p)), Infinity);
+    detents = buildSingleDetents(detentCfg, feasible, C, gapDegAt, noForbidden);
+    if (noSolution) {
+      // 保护区覆盖整圈：与“连续有解但无可用档位”区分
+      detents.best = null;
+      detents.noAvailable = false;
+    } else {
+      best = detents.best
+        ? {
+            mm: detents.best.mm,
+            deg: detents.best.deg,
+            detentIndex: detents.best.index,
+          }
+        : null; // 连续有解但没有任何可用档位
+    }
+  }
+
   return {
     circumference: C,
     seamWidth: W,
@@ -173,6 +209,7 @@ function computeSeamAvoidance(C, W, zones) {
     feasible,
     best,
     noSolution,
+    detents,
     coveragePct: Math.min(100, (coveredMm / C) * 100),
   };
 }
